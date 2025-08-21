@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.pyc
+
+# Audio files
+*.m4a
+*.wav
+
+# Virtual environment
+venv/
+.env
+
+# macOS
+.DS_Store
+
+# VSCode
+.vscode/
+
+# Python: compiled files
+*.py[cod]
+*$py.class
+
+# Virtual env alternatives
+.venv/
+env/
+ENV/
+
+# Packaging / build
+dist/
+build/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Type checking / caches
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs
+.idea/
+*.iml
+*.sublime-project
+*.sublime-workspace
+
+# Logs
+*.log
+logs/
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Binary / extension files
+*.so
+
+# Certificates / keys
+*.pem
+*.key
+*.crt
+
+# More audio formats
+*.mp3
+*.flac
+*.ogg
+*.aac
