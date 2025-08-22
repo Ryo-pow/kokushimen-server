@@ -3,21 +3,25 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, status
 from fastapi.security import APIKeyHeader
 import os
 import time
+import json
+import random
+import asyncio
+from typing import Union, Dict, Set
+
+# 外部ライブラリ
+import numpy as np
 from faster_whisper import WhisperModel
 import google.generativeai as genai
 from dotenv import load_dotenv
 import httpx
-from typing import Union, Dict, Set
-import random
-import json
-import numpy as np
 
 # .envファイルから環境変数を読み込む
 load_dotenv()
 
+# --- アプリケーションの初期化 ---
 app = FastAPI()
 
-# --- 認証 ---
+# --- 認証設定 ---
 # 環境変数から期待するAPIキーを取得
 EXPECTED_API_KEY = os.getenv("SERVER_AUTH_TOKEN", "dev-token-secret")
 # "Authorization" ヘッダーからAPIキーを読み取るための設定
@@ -25,19 +29,17 @@ api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 async def get_api_key(auth_header: str = Depends(api_key_header)):
     """ヘッダーを検証し、トークンが不正ならWebSocket接続を拒否する"""
-    if not auth_header:
+    if not auth_header or len(auth_header.split()) != 2:
         return None
     
-    parts = auth_header.split()
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        return None
-        
-    if parts[1] == EXPECTED_API_KEY:
-        return parts[1]
+    scheme, _, token = auth_header.partition(" ")
+    if scheme.lower() == "bearer" and token == EXPECTED_API_KEY:
+        return token
     return None
 
 # --- 接続管理 ---
 class ConnectionManager:
+    """WebSocket接続を管理するクラス"""
     def __init__(self):
         self.senders: Dict[str, WebSocket] = {}
         self.playbacks: Set[WebSocket] = set()
@@ -47,18 +49,13 @@ class ConnectionManager:
         await websocket.accept()
 
     def disconnect(self, websocket: WebSocket):
-        sender_to_remove = None
-        for stream_id, ws in self.senders.items():
-            if ws == websocket:
-                sender_to_remove = stream_id
-                break
+        sender_to_remove = next((stream_id for stream_id, ws in self.senders.items() if ws == websocket), None)
         if sender_to_remove:
             del self.senders[sender_to_remove]
             if sender_to_remove in self.audio_buffers:
                 del self.audio_buffers[sender_to_remove]
         
-        if websocket in self.playbacks:
-            self.playbacks.remove(websocket)
+        self.playbacks.discard(websocket)
 
     def add_sender(self, stream_id: str, websocket: WebSocket):
         self.senders[stream_id] = websocket
@@ -74,48 +71,40 @@ class ConnectionManager:
             self.audio_buffers[stream_id].extend(data)
 
     def get_and_clear_audio_data(self, stream_id: str) -> bytes:
-        if stream_id in self.audio_buffers:
-            data = bytes(self.audio_buffers[stream_id])
+        data = self.audio_buffers.get(stream_id, b'')
+        if data:
             self.audio_buffers[stream_id].clear()
-            return data
-        return b''
+        return bytes(data)
 
     async def broadcast_audio_chunks(self, audio_data: bytes, chunk_size: int):
         """再生クライアント全員に音声データをチャンクで送信"""
         for i in range(0, len(audio_data), chunk_size):
             chunk = audio_data[i:i+chunk_size]
-            for ws in self.playbacks:
-                try:
-                    await ws.send_bytes(chunk)
-                except Exception as e:
-                    print(f"再生クライアントへのチャンク送信エラー: {e}")
-            # 実際の時間経過に合わせて少し待つことで、クライアントのバッファ溢れを防ぐ
-            await asyncio.sleep(0.18) # 200msチャンクより少し短く設定
+            # チャンクごとに非同期タスクを作成して同時に送信
+            tasks = [ws.send_bytes(chunk) for ws in self.playbacks]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            # チャンクの再生時間に合わせて待機 (16kHz/16bit/mono)
+            await asyncio.sleep(chunk_size / (16000 * 2))
 
     async def broadcast_json(self, json_data: dict):
         """再生クライアント全員にJSONデータを送信"""
-        for ws in self.playbacks:
-            try:
-                await ws.send_json(json_data)
-            except Exception as e:
-                print(f"再生クライアントへのJSON送信エラー: {e}")
+        tasks = [ws.send_json(json_data) for ws in self.playbacks]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 manager = ConnectionManager()
 
 # --- 設定 ---
-AVAILABLE_SPEAKER_IDS = [2, 3, 1, 8, 10, 14]
 VOICEVOX_BASE_URL = "http://127.0.0.1:50021"
 # 16kHz, 16-bit, mono の 200ms 分のバイト数
 TTS_CHUNK_SIZE = 16000 * 2 * 1 * 200 // 1000 
 
 # --- モデルとAPIの準備 ---
 try:
-    # ▼▼▼ 改善点1: faster-whisper に変更 ▼▼▼
     # CPU: "int8", GPU: "float16" or "int8_float16"
-    model = WhisperModel("base", device="cpu", compute_type="int8")
+    whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
     print("✅ faster-whisperモデルのロード完了。")
 except Exception as e:
-    model = None
+    whisper_model = None
     print(f"❌ faster-whisperモデルのロード失敗: {e}")
 
 try:
@@ -129,15 +118,18 @@ except Exception as e:
     gemini_model = None
     print(f"❌ Geminiモデルの準備失敗: {e}")
 
-# --- 関数定義 ---
+# --- ヘルパー関数 ---
 async def generate_voicevox_audio(text: str, speaker_id: int) -> Union[bytes, None]:
+    """VOICEVOX APIを呼び出して音声を生成する"""
     async with httpx.AsyncClient() as client:
         try:
+            # 1. audio_queryの作成
             params = {"text": text, "speaker": speaker_id}
-            res_query = await client.post(f"{VOICEVOX_BASE_URL}/audio_query", params=params)
+            res_query = await client.post(f"{VOICEVOX_BASE_URL}/audio_query", params=params, timeout=10.0)
             res_query.raise_for_status()
             audio_query = res_query.json()
             
+            # 2. synthesisの実行
             headers = {"Content-Type": "application/json"}
             res_synth = await client.post(
                 f"{VOICEVOX_BASE_URL}/synthesis",
@@ -147,9 +139,8 @@ async def generate_voicevox_audio(text: str, speaker_id: int) -> Union[bytes, No
                 timeout=20.0
             )
             res_synth.raise_for_status()
-            
             return res_synth.content
-        except Exception as e:
+        except httpx.RequestError as e:
             print(f"❌ VOICEVOX API呼び出しでエラー: {e}")
             return None
 
@@ -160,7 +151,6 @@ def pcm_s16le_to_float32(audio_data: bytes) -> np.ndarray:
 # --- WebSocketエンドポイント ---
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = Depends(get_api_key)):
-    # ▼▼▼ 改善点4: 認証処理 ▼▼▼
     if not token:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         print("❌ 認証トークンが無効なため接続を拒否しました。")
@@ -174,10 +164,10 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Depends(get_api_
         while True:
             data = await websocket.receive()
 
-            if isinstance(data, str) or (isinstance(data, bytes) and data.startswith(b'{')):
+            # JSON形式の制御メッセージを処理
+            if "text" in data:
                 try:
-                    msg_text = data.decode('utf-8') if isinstance(data, bytes) else data
-                    msg_json = json.loads(msg_text)
+                    msg_json = json.loads(data["text"])
                     msg_type = msg_json.get("type")
 
                     if msg_type == "hello":
@@ -190,6 +180,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Depends(get_api_
                         elif role == "playback":
                             manager.add_playback(websocket)
                     
+                    # 発話終了の通知を受け取ったら、一連の処理を開始
                     elif msg_type == "stop" and is_sender and stream_id:
                         print(f"🎤 マイク '{stream_id}' から発話終了通知を受信。")
                         
@@ -199,16 +190,15 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Depends(get_api_
                             print("音声データが短すぎるためスキップします。")
                             continue
 
-                        if not model or not gemini_model:
+                        if not whisper_model or not gemini_model:
                             print("モデルが準備できていないため処理をスキップします。")
                             continue
                         
-                        # ▼▼▼ 改善点3: パフォーマンス計測 ▼▼▼
                         t_start = time.time()
 
                         # 1. Whisperで文字起こし
                         audio_np = pcm_s16le_to_float32(full_audio_data)
-                        segments, _ = model.transcribe(audio_np, beam_size=5, language="ja", vad_filter=True)
+                        segments, _ = whisper_model.transcribe(audio_np, beam_size=5, language="ja", vad_filter=True)
                         transcribed_text = "".join([s.text for s in segments]).strip()
                         t_asr = time.time()
 
@@ -217,42 +207,67 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Depends(get_api_
                             continue
                         print(f"✨ 文字起こし結果: {transcribed_text}")
 
-                        # 2. Geminiで応答生成
-                        prompt = f"ユーザーの発言「{transcribed_text}」に対して、親切で簡潔なアシスタントとして応答してください。"
-                        response = gemini_model.generate_content(prompt)
-                        ai_response_text = response.text
+                        # 2. Geminiで応答生成と感情分析
+                        prompt = f"""
+                        ユーザーの発言「{transcribed_text}」を分析してください。
+                        以下の2つの項目を含むJSON形式で、結果だけを出力してください。
+
+                        1. "emotion": 発言から最も強く感じられる感情を「喜び」「怒り」「悲しみ」「平常」のいずれか一つで示してください。
+                        2. "reply": 親切で簡潔なアシスタントとしての応答メッセージを作成してください。
+                        """
+                        response = await gemini_model.generate_content_async(prompt)
+                        ai_response_json_str = response.text
+
+                        try:
+                            # Geminiの出力からJSON部分だけを安全に抜き出す
+                            if "```json" in ai_response_json_str:
+                                ai_response_json_str = ai_response_json_str.split('```json\n')[1].split('\n```')[0]
+                            
+                            ai_response_data = json.loads(ai_response_json_str)
+                            ai_emotion = ai_response_data.get("emotion", "平常")
+                            ai_response_text = ai_response_data.get("reply", "すみません、うまく聞き取れませんでした。")
+                        except Exception as e:
+                            print(f"❌ Geminiの応答(JSON)の解析に失敗しました: {e}")
+                            ai_emotion = "平常"
+                            ai_response_text = "すみません、少し調子が悪いようです。"
+
                         t_llm = time.time()
+                        print(f"😊 感情分析結果: {ai_emotion}")
                         print(f"💬 Geminiからの応答: {ai_response_text}")
 
-                        # 3. VOICEVOXで音声合成
-                        selected_speaker_id = random.choice(AVAILABLE_SPEAKER_IDS)
+                        # 3. VOICEVOXで音声合成 (感情に応じて話者を変更)
+                        speaker_map = {"喜び": 3, "悲しみ": 1, "怒り": 8, "平常": 2} # 例: ずんだもん(3), 四国めたん(1), 玄野武宏(8), 雨晴はう(2)
+                        selected_speaker_id = speaker_map.get(ai_emotion, speaker_map["平常"])
+                        print(f"🗣️  話者ID '{selected_speaker_id}' を選択しました。")
+                        
                         voice_data = await generate_voicevox_audio(ai_response_text, speaker_id=selected_speaker_id)
                         t_tts = time.time()
 
                         # 4. 再生クライアントに音声データをブロードキャスト
                         if voice_data:
-                            # ▼▼▼ 改善点2: 音声をチャンクで分割送信 ▼▼▼
                             print(f"🔊 全再生クライアントに音声データ ({len(voice_data)} bytes) を分割送信します。")
                             await manager.broadcast_audio_chunks(voice_data, TTS_CHUNK_SIZE)
                             await manager.broadcast_json({"type": "tts_done"})
                             print("ℹ️  ミュート解除のための完了通知を送信しました。")
                         
                         t_end = time.time()
-                        # パフォーマンスログを出力
                         print(f"⏱️  パフォーマンス: [ASR: {t_asr - t_start:.2f}s] [LLM: {t_llm - t_asr:.2f}s] [TTS: {t_tts - t_llm:.2f}s] [Total: {t_end - t_start:.2f}s]")
 
                 except Exception as e:
                     print(f"制御メッセージ処理中にエラー: {e}")
 
-            elif isinstance(data, bytes) and is_sender and stream_id:
-                manager.append_audio_data(stream_id, data)
+            # バイナリ形式の音声データをバッファに追加
+            elif "bytes" in data and is_sender and stream_id:
+                manager.append_audio_data(stream_id, data["bytes"])
 
     except WebSocketDisconnect:
         print(f"クライアントが切断しました。")
+    except Exception as e:
+        print(f"予期せぬエラーが発生しました: {e}")
     finally:
         manager.disconnect(websocket)
         print("接続をクリーンアップしました。")
 
+# --- サーバーの起動 ---
 if __name__ == "__main__":
-    import asyncio
     uvicorn.run(app, host="0.0.0.0", port=8000)
