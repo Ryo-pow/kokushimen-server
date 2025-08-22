@@ -71,3 +71,7 @@ Desktop.ini
 *.flac
 *.ogg
 *.aac
+
+# Study file
+study.md
+kokusimen-client

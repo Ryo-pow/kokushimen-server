@@ -78,7 +78,15 @@ async def websocket_endpoint(websocket: WebSocket, mic_id: str):
 
     try:
         while True:
-            audio_data = await websocket.receive_bytes()
+            data = await websocket.receive()
+            # クライアントからは音声(bytes)と制御(str)が送られてくる
+            # 音声データでなければ処理をスキップ
+            if not isinstance(data, bytes):
+                print(f"ℹ️  マイク '{mic_id}' からテキストメッセージ（おそらく制御用）を受信: {data}")
+                continue
+            
+            audio_data = data
+
             if not model or not gemini_model:
                 print("モデルが準備できていないため処理をスキップします。")
                 continue
@@ -111,6 +119,10 @@ async def websocket_endpoint(websocket: WebSocket, mic_id: str):
             if voice_data:
                 print(f"🔊 クライアントに音声データ ({len(voice_data)} bytes) を送信します。")
                 await websocket.send_bytes(voice_data)
+                # ミュート解除のために完了通知を送信
+                await websocket.send_json({"type": "tts_done"})
+                print("ℹ️  ミュート解除のための完了通知を送信しました。")
+
 
     except WebSocketDisconnect:
         print(f"❌ マイク '{mic_id}' が切断しました。")
