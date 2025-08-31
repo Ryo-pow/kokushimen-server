@@ -159,16 +159,17 @@ def pcm_s16le_to_float32(audio_data: bytes) -> np.ndarray:
     return np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
 
 # --- WebSocketエンドポイント ---
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, token: str = Depends(get_api_key)):
+@app.websocket("/ws/{mic_id}")
+async def websocket_endpoint(websocket: WebSocket, mic_id: str, token: str = Depends(get_api_key)):
     if not token:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         print("❌ 認証トークンが無効なため接続を拒否しました。")
         return
 
     await manager.connect(websocket)
-    stream_id = None
-    is_sender = False
+    # URLのmic_idをstream_idとして即時登録
+    stream_id = mic_id
+    manager.add_sender(stream_id, websocket)
 
     # ストリームごとの処理中フラグ
     is_processing = False
@@ -254,19 +255,9 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Depends(get_api_
                 try:
                     msg_json = json.loads(data["text"])
                     msg_type = msg_json.get("type")
-
-                    if msg_type == "hello":
-                        role = msg_json.get("role")
-                        if role == "sender":
-                            stream_id = msg_json.get("stream_id")
-                            if stream_id:
-                                manager.add_sender(stream_id, websocket)
-                                is_sender = True
-                        elif role == "playback":
-                            manager.add_playback(websocket)
                     
                     # 発話終了の通知を受け取ったら、一連の処理を開始
-                    elif msg_type == "stop" and is_sender and stream_id:
+                    if msg_type == "stop":
                         print(f"🎤 マイク '{stream_id}' から発話終了通知を受信。")
                         full_audio_data = manager.get_and_clear_audio_data(stream_id)
                         if not is_processing:
@@ -277,7 +268,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Depends(get_api_
                     print(f"制御メッセージ処理中にエラー: {e}")
 
             # バイナリ形式の音声データをバッファに追加
-            elif "bytes" in data and is_sender and stream_id:
+            elif "bytes" in data:
                 # 音声フレームを蓄積
                 manager.append_audio_data(stream_id, data["bytes"])
                 # しきい値を超えたら自動的に処理開始（ストリーミング）
@@ -298,4 +289,4 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Depends(get_api_
 
 # --- サーバーの起動 ---
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
