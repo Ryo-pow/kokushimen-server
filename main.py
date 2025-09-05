@@ -23,19 +23,7 @@ app = FastAPI()
 
 # --- 認証設定 ---
 # 環境変数から期待するAPIキーを取得
-EXPECTED_API_KEY = os.getenv("SERVER_AUTH_TOKEN", "dev-token-secret")
-# "Authorization" ヘッダーからAPIキーを読み取るための設定
-api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
-
-async def get_api_key(auth_header: str = Depends(api_key_header)):
-    """ヘッダーを検証し、トークンが不正ならWebSocket接続を拒否する"""
-    if not auth_header or len(auth_header.split()) != 2:
-        return None
-    
-    scheme, _, token = auth_header.partition(" ")
-    if scheme.lower() == "bearer" and token == EXPECTED_API_KEY:
-        return token
-    return None
+EXPECTED_API_KEY = os.getenv("SERVER_AUTH_TOKEN", "dev-token")
 
 # --- 接続管理 ---
 class ConnectionManager:
@@ -123,6 +111,10 @@ except Exception as e:
     print(f"❌ Geminiモデルの準備失敗: {e}")
 
 # --- ヘルパー関数 ---
+def pcm_s16le_to_float32(audio_data: bytes) -> np.ndarray:
+    """生PCM(s16le)データをWhisperが処理できるfloat32形式に変換"""
+    return np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+
 async def generate_voicevox_audio(text: str, speaker_id: int) -> Union[bytes, None]:
     """VOICEVOX APIを呼び出して音声を生成する"""
     async with httpx.AsyncClient() as client:
@@ -154,16 +146,24 @@ async def generate_voicevox_audio(text: str, speaker_id: int) -> Union[bytes, No
             print(f"❌ VOICEVOX API呼び出しでエラー: {e}")
             return None
 
-def pcm_s16le_to_float32(audio_data: bytes) -> np.ndarray:
-    """生PCM(s16le)データをWhisperが処理できるfloat32形式に変換"""
-    return np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-
 # --- WebSocketエンドポイント ---
 @app.websocket("/ws/{mic_id}")
-async def websocket_endpoint(websocket: WebSocket, mic_id: str, token: str = Depends(get_api_key)):
-    if not token:
+async def websocket_endpoint(websocket: WebSocket, mic_id: str):
+    # ヘッダーから認証トークンを取得し、手動で検証する
+    auth_header = websocket.headers.get("Authorization")
+    token = None
+    if auth_header:
+        try:
+            scheme, _, token_value = auth_header.partition(" ")
+            if scheme.lower() == "bearer":
+                token = token_value
+        except Exception:
+            pass  # 無効なヘッダー形式
+
+    # トークンが期待値と一致しない場合は接続を拒否
+    if token != EXPECTED_API_KEY:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        print("❌ 認証トークンが無効なため接続を拒否しました。")
+        print(f"❌ 認証トークンが無効なため接続を拒否しました: {auth_header}")
         return
 
     await manager.connect(websocket)
@@ -171,11 +171,10 @@ async def websocket_endpoint(websocket: WebSocket, mic_id: str, token: str = Dep
     stream_id = mic_id
     manager.add_sender(stream_id, websocket)
 
-    # ストリームごとの処理中フラグ
-    is_processing = False
+    # ストリームごとの処理ロック
+    processing_lock = asyncio.Lock()
 
     async def run_pipeline(full_audio_data: bytes):
-        nonlocal is_processing
         try:
             if len(full_audio_data) < 1600:  # 100ms 未満は無視
                 print("音声データが短すぎるためスキップします。")
@@ -196,25 +195,29 @@ async def websocket_endpoint(websocket: WebSocket, mic_id: str, token: str = Dep
             print(f"✨ 文字起こし結果: {transcribed_text}")
 
             # 2. Gemini で応答 + 感情
-            prompt = f"""
-            ユーザーの発言「{transcribed_text}」を分析してください。
-            以下の2つの項目を含むJSON形式で、結果だけを出力してください。
-
-            1. "emotion": 発言から最も強く感じられる感情を「喜び」「怒り」「悲しみ」「平常」のいずれか一つで示してください。
-            2. "reply": 親切で簡潔なアシスタントとしての応答メッセージを作成してください。
-            """
-            response = await gemini_model.generate_content_async(prompt)
-            ai_response_json_str = response.text
+            ai_response_text = "すみません、AIの応答生成でエラーが発生しました。"
+            ai_emotion = "平常"
             try:
+                prompt = f'''
+                ユーザーの発言「{transcribed_text}」を分析してください。
+                以下の2つの項目を含むJSON形式で、結果だけを出力してください。
+
+                1. "emotion": 発言から最も強く感じられる感情を「喜び」「怒り」「悲しみ」「平常」のいずれか一つで示してください。
+                2. "reply": 親切で簡潔なアシスタントとしての応答メッセージを作成してください。
+                '''
+                response = await gemini_model.generate_content_async(prompt)
+                ai_response_json_str = response.text
+                
+                # JSONパース処理
                 if "```json" in ai_response_json_str:
                     ai_response_json_str = ai_response_json_str.split('```json\n')[1].split('\n```')[0]
                 ai_response_data = json.loads(ai_response_json_str)
                 ai_emotion = ai_response_data.get("emotion", "平常")
                 ai_response_text = ai_response_data.get("reply", "すみません、うまく聞き取れませんでした。")
+
             except Exception as e:
-                print(f"❌ Geminiの応答(JSON)の解析に失敗しました: {e}")
-                ai_emotion = "平常"
-                ai_response_text = "すみません、少し調子が悪いようです。"
+                print(f"❌ Gemini APIの呼び出し、または応答の解析中にエラーが発生しました: {type(e).__name__}: {e}")
+
             t_llm = time.time()
             print(f"😊 感情分析結果: {ai_emotion}")
             print(f"💬 Geminiからの応答: {ai_response_text}")
@@ -243,49 +246,49 @@ async def websocket_endpoint(websocket: WebSocket, mic_id: str, token: str = Dep
 
             t_end = time.time()
             print(f"⏱️  パフォーマンス: [ASR: {t_asr - t_start:.2f}s] [LLM: {t_llm - t_asr:.2f}s] [TTS: {t_tts - t_llm:.2f}s] [Total: {t_end - t_start:.2f}s]")
-        finally:
-            is_processing = False
+        except Exception as e:
+            print(f"PIPELINE ERROR: {e}")
 
     try:
         while True:
-            data = await websocket.receive()
+            message = await websocket.receive()
 
-            # JSON形式の制御メッセージを処理
-            if "text" in data:
+            # メッセージタイプに応じて処理を分岐
+            if message["type"] == "websocket.disconnect":
+                break
+
+            # テキストメッセージ(JSON)を処理
+            text_data = message.get("text")
+            if text_data:
                 try:
-                    msg_json = json.loads(data["text"])
+                    msg_json = json.loads(text_data)
                     msg_type = msg_json.get("type")
                     
-                    # 発話終了の通知を受け取ったら、一連の処理を開始
                     if msg_type == "stop":
-                        print(f"🎤 マイク '{stream_id}' から発話終了通知を受信。")
-                        full_audio_data = manager.get_and_clear_audio_data(stream_id)
-                        if not is_processing:
-                            is_processing = True
-                            await run_pipeline(full_audio_data)
+                        # 処理中でなければロックを取得してパイプラインを実行
+                        if not processing_lock.locked():
+                            async with processing_lock:
+                                print(f"🎤 マイク '{stream_id}' から発話終了通知を受信。")
+                                full_audio_data = manager.get_and_clear_audio_data(stream_id)
+                                await run_pipeline(full_audio_data)
+                        else:
+                            print(f"⚠️ '{stream_id}' は現在処理中のため、stop通知をスキップします。")
 
                 except Exception as e:
                     print(f"制御メッセージ処理中にエラー: {e}")
 
-            # バイナリ形式の音声データをバッファに追加
-            elif "bytes" in data:
-                # 音声フレームを蓄積
-                manager.append_audio_data(stream_id, data["bytes"])
-                # しきい値を超えたら自動的に処理開始（ストリーミング）
-                buf = manager.audio_buffers.get(stream_id)
-                if buf is not None and (not is_processing) and len(buf) >= STREAM_THRESHOLD_BYTES:
-                    full_audio_data = manager.get_and_clear_audio_data(stream_id)
-                    is_processing = True
-                    # バックグラウンドで実行
-                    asyncio.create_task(run_pipeline(full_audio_data))
+            # バイナリメッセージ(音声データ)を処理
+            bytes_data = message.get("bytes")
+            if bytes_data:
+                manager.append_audio_data(stream_id, bytes_data)
 
     except WebSocketDisconnect:
-        print(f"クライアントが切断しました。")
+        print(f"クライアントが切断しました: {mic_id}")
     except Exception as e:
-        print(f"予期せぬエラーが発生しました: {e}")
+        print(f"予期せぬエラーが発生しました ({mic_id}): {e}")
     finally:
         manager.disconnect(websocket)
-        print("接続をクリーンアップしました。")
+        print(f"接続をクリーンアップしました: {mic_id}")
 
 # --- サーバーの起動 ---
 if __name__ == "__main__":
