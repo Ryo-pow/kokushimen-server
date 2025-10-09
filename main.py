@@ -41,7 +41,7 @@ try:
     if not gemini_api_key:
         raise ValueError("環境変数にGEMINI_API_KEYが設定されていません。")
     genai.configure(api_key=gemini_api_key)
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+    gemini_model = genai.GenerativeModel("gemini-flash-latest")
     print("✅ Geminiモデルの準備完了。")
 except Exception as e:
     gemini_model = None
