@@ -208,12 +208,37 @@ async def process_audio_to_ai_response(mic_id: str, audio_data: bytes):
             return
         print(f"✨ 文字起こし結果 ({mic_id}): {transcribed_text}")
 
-        # 2. Geminiで応答生成
-        prompt = f"ユーザーの発言「{transcribed_text}」に対して、親切で簡潔なアシスタントとして応答してください。"
-        
+        # 2. Geminiで応答生成と感情分析
+        prompt = f"""あなたは高性能な会話を補助するアシスタントです。
+ユーザーの発言「{transcribed_text}」に対して、以下のJSON形式で応答を生成してください。
+
+{{
+  "emotion": "ユーザーの発言から推測される感情を「喜び」「怒り」「悲しみ」「平常」のいずれかで示してください。",
+  "reply": "以下の制約を守り、ユーザーの発言を失礼のないように丁寧に変換してください。\n- 必ず日本語で出力してください。\n- 顔文字、絵文字、専門的な機械語は使用しないでください。\n- 1文は60〜90文字程度に収めてください。\n- 読点（、）は1文に2つまでとして、簡潔にしてください。\n- 場面としては、日常会話でカジュアルで自然な日本語に変換してください。\n- ユーザーの発話が質問や依頼の場合は、相手に失礼のないよう、丁寧な表現に変換してください。\n- ユーザーの発話が否定的な内容の場合は、相手を不快にさせないよう、柔らかい表現に変換してください。"
+}}
+"""
         response = gemini_model.generate_content(prompt)
-        ai_response_text = response.text
-        print(f"💬 Geminiからの応答 ({mic_id}): {ai_response_text}")
+        
+        ai_response_text = ""
+        try:
+            # ```json ... ``` のようなコードフェンスを削除
+            cleaned_response = response.text.strip().removeprefix("```json").removesuffix("```").strip()
+            
+            data = json.loads(cleaned_response)
+            emotion = data.get("emotion", "不明")
+            ai_response_text = data.get("reply", "")
+
+            print(f"😃 感情分析結果 ({mic_id}): {emotion}")
+            print(f"💬 Geminiからの応答 ({mic_id}): {ai_response_text}")
+
+        except (json.JSONDecodeError, AttributeError) as e:
+            print(f"⚠️ Geminiからの応答のJSONパースに失敗しました: {e}")
+            # パース失敗時は、応答テキストをそのまま使う
+            ai_response_text = response.text
+
+        if not ai_response_text:
+            print("AIの応答が空でした。処理を中断します。")
+            return
 
         # 3. (★目標達成) Geminiのテキストをクライアントに送信
         await manager.broadcast_text(mic_id, ai_response_text)
