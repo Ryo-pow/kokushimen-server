@@ -117,6 +117,17 @@ class ConnectionManager:
                 print(f"❌ [Playback] '{mic_id}' へのテキスト送信失敗: {e}")
                 self.disconnect_playback(mic_id)
 
+    async def broadcast_emotion(self, mic_id: str, emotion: str):
+        """指定されたmic_idの再生クライアントに感情分析結果を送信"""
+        ws = await self.get_playback_ws(mic_id)
+        if ws:
+            try:
+                await ws.send_json({"type": "emotion", "emotion": emotion})
+                print(f"😃 [Playback] '{mic_id}' へ感情送信: {emotion}")
+            except Exception as e:
+                print(f"❌ [Playback] '{mic_id}' への感情送信失敗: {e}")
+                self.disconnect_playback(mic_id)
+
     async def broadcast_audio(self, mic_id: str, audio_data: bytes):
         """指定されたmic_idの再生クライアントに音声(bytes)を送信"""
         ws = await self.get_playback_ws(mic_id)
@@ -265,8 +276,9 @@ async def process_audio_to_ai_response(mic_id: str, audio_data: bytes):
             print("AIの応答が空でした。処理を中断します。")
             return
 
-        # 3. (★目標達成) Geminiのテキストをクライアントに送信
+        # 3. Geminiの結果をクライアントに送信
         await manager.broadcast_text(mic_id, ai_response_text)
+        await manager.broadcast_emotion(mic_id, emotion)
 
         # 4. VOICEVOXで音声合成
         selected_speaker_id = random.choice(AVAILABLE_SPEAKER_IDS)
